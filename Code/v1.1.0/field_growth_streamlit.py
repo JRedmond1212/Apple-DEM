@@ -1,49 +1,43 @@
 # field_growth_streamlit.py
 # -------------------------------------------------------------------
-# Streamlined Streamlit UI for open-field growth simulations
-# - Deterministic RNG: per-(year,sim) seeds
-# - Yearly arrays sorted chronologically (stateful soil moisture)
-# - Gaussian effects peak at 1.0 (parity with original model)
-# - Uses float64; Numba auto-enabled if available (no UI toggles)
-# - Minimal UI: summary table, mean±std plot, and daily+cum plots
+# Streamlit Cloud–friendly UI for open-field growth simulations
+# - File uploader (no local Windows paths)
+# - Deterministic RNG per (year, sim)
+# - Chronological arrays (stateful soil moisture)
+# - Gaussian effects peak at 1.0 (parity with original)
+# - Optional Numba if available (no UI toggles needed)
+# - Matplotlib optional: graceful fallback to Streamlit charts
+# - Minimal UI: summary table, mean±std plot, daily bars + cumulative
 # -------------------------------------------------------------------
 
 import datetime
-from pathlib import Path
+from io import BytesIO
 
 import numpy as np
 import pandas as pd
-
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-
 import streamlit as st
 
-# --------------------------- Optional guard: catch bare mode ---------------------------
+# ---- Plotting imports with graceful fallback ----
+HAS_MPL = True
 try:
-    from streamlit.runtime.scriptrunner import get_script_run_ctx
-    if get_script_run_ctx() is None:
-        print("Launch with:  python -m streamlit run path\\to\\field_growth_streamlit.py")
-        raise SystemExit(1)
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
 except Exception:
-    pass
+    HAS_MPL = False
 
 # --------------------------- Page config ---------------------------
 st.set_page_config(page_title="Open-field Growth Simulation", layout="wide")
 st.title("Open-field Growth Simulation — v.1.1.7")
 
-# --------------------------- Try Numba ---------------------------
+# --------------------------- Try Numba (optional) ---------------------------
 try:
     from numba import njit
     HAS_NUMBA = True
 except Exception:
     HAS_NUMBA = False
 
-# --------------------------- Defaults ---------------------------
-DEFAULT_BASE_DIR = Path(r"C:\(A) UNI\4th Year\MEng Final Year Project\Previous Years Project\Discrete-Event-Modelling-main\Discrete-Event-Modelling-main")
-DEFAULT_XLSX = DEFAULT_BASE_DIR / "2013-present weather data 2.xlsx"
-
+# --------------------------- Constants ---------------------------
 SOIL_TYPES = ["Sandy", "Loamy Sand", "Sandy Loam", "Silty Loam", "Silty Clay Loam", "Silty Clay", "Clay"]
 SOIL_DRAINAGE = ["Well drained", "Moderately drained", "Poorly drained"]
 OPTIMAL_TEMP_RANGE_GROWING = (15, 26)  # °C
@@ -62,9 +56,18 @@ ss.setdefault("year_arrays_key", None)
 ss.setdefault("year_arrays", {})
 
 # --------------------------- Helpers ---------------------------
+def _bytes_sha1(b: bytes) -> str:
+    import hashlib
+    h = hashlib.sha1()
+    h.update(b)
+    return h.hexdigest()
+
 @st.cache_data(show_spinner=False)
-def load_weather(path: Path) -> pd.DataFrame:
-    df = pd.read_excel(path, engine="openpyxl")
+def load_weather_from_bytes(content: bytes) -> pd.DataFrame:
+    """
+    Load the Excel from uploaded bytes. Cloud-safe (no filesystem assumptions).
+    """
+    df = pd.read_excel(BytesIO(content), engine=None)  # let pandas pick engine
     if "Day" in df.columns:
         df["Day"] = df["Day"].fillna(0)
     if "g_rad (J/cm^2/day)" in df.columns:
@@ -180,8 +183,6 @@ def strawberry_growth_scalar(G_max, temperature, PPFD, humidity, soil_moisture_m
 
 # --------------------------- Optional Numba kernel ---------------------------
 if HAS_NUMBA:
-    from numba import njit
-
     @njit(cache=True, fastmath=True)
     def _simulate_one_year_kernel(
         days, temp, ppfd, hum, rain, pe, smd_wd, smd_md, smd_pd,
@@ -251,11 +252,23 @@ if HAS_NUMBA:
 
         return total_growth_per_m2
 
-# --------------------------- Sidebar Inputs (minimal) ---------------------------
+# --------------------------- Sidebar Inputs (Cloud-safe) ---------------------------
 with st.sidebar:
     st.header("Inputs")
-    xlsx_path_str = st.text_input("Excel weather file path", value=str(DEFAULT_XLSX))
-    xlsx_path = Path(xlsx_path_str)
+
+    uploaded = st.file_uploader("Upload weather Excel (.xlsx)", type=["xlsx"])
+    if uploaded is not None:
+        content = uploaded.read()
+        sha = _bytes_sha1(content)
+        df = load_weather_from_bytes(content)
+        ss.df = df
+        ss.loaded = True
+        ss.year_bounds = year_range_in(df)
+        ss.year_arrays = {}  # rebuild on next use
+        ss.year_arrays_key = sha
+        st.success(f"Weather loaded. Rows: {len(df):,}")
+    else:
+        st.info("Upload a weather Excel to begin.")
 
     field_length   = st.slider("Field length (m)", 1.0, 1000.0, 100.0, 1.0)
     field_width    = st.slider("Field width (m)",  1.0, 1000.0, 50.0, 1.0)
@@ -278,21 +291,6 @@ with st.sidebar:
     store_daily = st.checkbox("Store per-simulation daily series", value=True)
     max_daily_store = st.slider("Max per-year stored series", 1, 50, 10, 1)
 
-    load_btn = st.button("Load weather data")
-
-# --------------------------- Handle Load ---------------------------
-if load_btn:
-    if not xlsx_path.exists():
-        st.error(f"File not found: {xlsx_path}")
-    else:
-        df = load_weather(xlsx_path)
-        ss.df = df
-        ss.loaded = True
-        ss.year_bounds = year_range_in(df)
-        ss.year_arrays = {}  # rebuild on next use
-        ss.year_arrays_key = str(xlsx_path.resolve())
-        st.success(f"Weather loaded. Rows: {len(df):,}")
-
 # --------------------------- Input summary ---------------------------
 with st.expander("Input summary", expanded=False):
     field_area = field_length * field_width
@@ -312,7 +310,7 @@ with st.expander("Input summary", expanded=False):
 def _get_year_arrays():
     if not ss.loaded or ss.df is None:
         return {}
-    key = str(Path(xlsx_path).resolve())
+    key = ss.year_arrays_key
     if ss.year_arrays_key != key or not ss.year_arrays:
         ss.year_arrays = preprocess_year_arrays(ss.df)
         ss.year_arrays_key = key
@@ -440,7 +438,7 @@ def run_simulations_fast(df, year_from, year_to,
 
     return results_df, per_sim_yields, per_sim_daily, planting_windows
 
-# --------------------------- Run controls (minimal) ---------------------------
+# --------------------------- Run controls ---------------------------
 yr_min, yr_max = ss.year_bounds
 if ss.loaded:
     year_from, year_to = st.slider("Year range to simulate", min_value=yr_min, max_value=yr_max,
@@ -454,7 +452,7 @@ run_btn = st.button("▶ Run simulations")
 # --------------------------- Run on click ---------------------------
 if run_btn:
     if not ss.loaded or ss.df is None:
-        st.warning("Load weather data first.")
+        st.warning("Upload weather data first.")
     else:
         with st.spinner("Simulating…"):
             results_df, per_sim_yields, per_sim_daily, planting_windows = run_simulations_fast(
@@ -478,17 +476,24 @@ if ss.results_df is not None:
     st.subheader("Results summary")
     st.dataframe(ss.results_df, use_container_width=True)
 
-    # Plot: mean ± std
-    fig1, ax1 = plt.subplots(figsize=(10, 5))
-    ax1.errorbar(ss.results_df["Year"], ss.results_df["Average_Yield_kg"],
-                 yerr=ss.results_df["StdDev_Yield_kg"], marker="o", linestyle="-", capsize=4)
-    ax1.set_xlabel("Year"); ax1.set_ylabel("Total yield (kg)")
-    ax1.set_title("Average total yield per year (±1 std dev)")
-    ax1.grid(axis="y", alpha=0.3)
-    st.pyplot(fig1)
+    # Plot: mean ± std (fallback if matplotlib missing)
+    if HAS_MPL:
+        fig1, ax1 = plt.subplots(figsize=(10, 5))
+        ax1.errorbar(ss.results_df["Year"], ss.results_df["Average_Yield_kg"],
+                     yerr=ss.results_df["StdDev_Yield_kg"], marker="o", linestyle="-", capsize=4)
+        ax1.set_xlabel("Year"); ax1.set_ylabel("Total yield (kg)")
+        ax1.set_title("Average total yield per year (±1 std dev)")
+        ax1.grid(axis="y", alpha=0.3)
+        st.pyplot(fig1)
+    else:
+        st.info("Matplotlib not available — showing line chart without error bars.")
+        st.line_chart(
+            ss.results_df.set_index("Year")["Average_Yield_kg"],
+            height=300
+        )
 
     # Plot: Daily growth + Cumulative (always shown)
-    st.markdown("### Daily growth (per-day series) with cumulative overlay")
+    st.markdown("### Daily growth (per-day) with cumulative overlay")
     if ss.per_sim_daily:
         years_with_series = sorted([y for y, sims in ss.per_sim_daily.items() if sims])
         if years_with_series:
@@ -499,25 +504,35 @@ if ss.results_df is not None:
             series = ss.per_sim_daily[y_for_daily][sim_for_daily]
             days = series["days"]; growth_vals = series["growth"]
 
-            # Daily bars
-            fig3, ax3 = plt.subplots(figsize=(12, 5))
-            ax3.bar(days, growth_vals)
-            ax3.set_xlabel("Day of Year"); ax3.set_ylabel("Growth (kg/m² per day)")
-            ax3.set_title(f"Daily growth — Year {y_for_daily}, Simulation {sim_for_daily}")
-            if y_for_daily in ss.planting_windows:
-                p_doy, h_doy = ss.planting_windows[y_for_daily]
-                ax3.axvline(x=p_doy, linestyle="--")
-                ax3.axvline(x=h_doy, linestyle="--")
-            st.pyplot(fig3)
+            if HAS_MPL:
+                # Daily bars
+                fig3, ax3 = plt.subplots(figsize=(12, 5))
+                ax3.bar(days, growth_vals)
+                ax3.set_xlabel("Day of Year"); ax3.set_ylabel("Growth (kg/m² per day)")
+                ax3.set_title(f"Daily growth — Year {y_for_daily}, Simulation {sim_for_daily}")
+                if y_for_daily in ss.planting_windows:
+                    p_doy, h_doy = ss.planting_windows[y_for_daily]
+                    ax3.axvline(x=p_doy, linestyle="--")
+                    ax3.axvline(x=h_doy, linestyle="--")
+                st.pyplot(fig3)
 
-            # Cumulative line (always)
-            cum = np.cumsum(growth_vals)
-            fig4, ax4 = plt.subplots(figsize=(12, 4))
-            ax4.plot(days, cum)
-            ax4.set_xlabel("Day of Year"); ax4.set_ylabel("Cumulative growth (kg/m²)")
-            ax4.set_title(f"Cumulative growth — Year {y_for_daily}, Simulation {sim_for_daily}")
-            ax4.grid(axis="y", alpha=0.3)
-            st.pyplot(fig4)
+                # Cumulative line (always)
+                cum = np.cumsum(growth_vals)
+                fig4, ax4 = plt.subplots(figsize=(12, 4))
+                ax4.plot(days, cum)
+                ax4.set_xlabel("Day of Year"); ax4.set_ylabel("Cumulative growth (kg/m²)")
+                ax4.set_title(f"Cumulative growth — Year {y_for_daily}, Simulation {sim_for_daily}")
+                ax4.grid(axis="y", alpha=0.3)
+                st.pyplot(fig4)
+            else:
+                st.info("Matplotlib not available — using Streamlit charts.")
+                # Daily bars (approximate)
+                daily_df = pd.DataFrame({"Growth": growth_vals}, index=pd.Index(days, name="Day_of_Year"))
+                st.bar_chart(daily_df, height=300)
+                # Cumulative
+                cum = np.cumsum(growth_vals)
+                cum_df = pd.DataFrame({"Cumulative": cum}, index=pd.Index(days, name="Day_of_Year"))
+                st.line_chart(cum_df, height=250)
         else:
             st.info("No stored daily series. Enable storage and re-run.")
     else:
